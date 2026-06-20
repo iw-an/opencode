@@ -38,6 +38,8 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 const originalEnv = {
   OPENCODE_AUTH_CONTENT: process.env.OPENCODE_AUTH_CONTENT,
   OPENCODE_EXPERIMENTAL_WORKSPACES: process.env.OPENCODE_EXPERIMENTAL_WORKSPACES,
+  OTEL_TRACES_EXPORTER: process.env.OTEL_TRACES_EXPORTER,
+  OTEL_LOGS_EXPORTER: process.env.OTEL_LOGS_EXPORTER,
   OTEL_EXPORTER_OTLP_HEADERS: process.env.OTEL_EXPORTER_OTLP_HEADERS,
   OTEL_EXPORTER_OTLP_ENDPOINT: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
   OTEL_EXPORTER_OTLP_PROTOCOL: process.env.OTEL_EXPORTER_OTLP_PROTOCOL,
@@ -429,6 +431,8 @@ describe("workspace CRUD", () => {
         const instance = yield* requireInstance
         const workspace = yield* Workspace.Service
         process.env.OPENCODE_AUTH_CONTENT = JSON.stringify({ test: { type: "api", key: "secret" } })
+        process.env.OTEL_TRACES_EXPORTER = "otlp"
+        process.env.OTEL_LOGS_EXPORTER = "none"
         process.env.OTEL_EXPORTER_OTLP_HEADERS = "authorization=otel"
         process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "https://otel.test"
         process.env.OTEL_EXPORTER_OTLP_PROTOCOL = "http/protobuf"
@@ -495,6 +499,8 @@ describe("workspace CRUD", () => {
         })
         expect(recorded.calls.create[0].env.OPENCODE_WORKSPACE_ID).toBe(workspaceID)
         expect(recorded.calls.create[0].env.OPENCODE_EXPERIMENTAL_WORKSPACES).toBe("true")
+        expect(recorded.calls.create[0].env.OTEL_TRACES_EXPORTER).toBe("otlp")
+        expect(recorded.calls.create[0].env.OTEL_LOGS_EXPORTER).toBe("none")
         expect(recorded.calls.create[0].env.OTEL_EXPORTER_OTLP_HEADERS).toBe("authorization=otel")
         expect(recorded.calls.create[0].env.OTEL_EXPORTER_OTLP_ENDPOINT).toBe("https://otel.test")
         expect(recorded.calls.create[0].env.OTEL_EXPORTER_OTLP_PROTOCOL).toBe("http/protobuf")

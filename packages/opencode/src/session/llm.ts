@@ -4,9 +4,11 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Provider } from "@/provider/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Layer, Option } from "effect"
 import * as Stream from "effect/Stream"
 import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
+import { Otlp } from "@opencode-ai/core/observability/otlp"
+import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import type { LLMEvent } from "@opencode-ai/llm"
 import { LLMClient, RequestExecutor, WebSocketExecutor } from "@opencode-ai/llm/route"
 import type { LLMClientService } from "@opencode-ai/llm/route"
@@ -24,8 +26,6 @@ import { SessionID } from "@/session/schema"
 import { Auth } from "@/auth"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
-import * as Option from "effect/Option"
-import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
@@ -205,20 +205,11 @@ const live: Layer.Layer<
         })
       }
 
-      const tracer = cfg.experimental?.openTelemetry
+      const telemetryTracer = cfg.experimental?.openTelemetry
         ? Option.getOrUndefined(yield* Effect.serviceOption(OtelTracer.OtelTracer))
         : undefined
-      const telemetryTracer = tracer
-        ? new Proxy(tracer, {
-            get(target, prop, receiver) {
-              if (prop !== "startSpan") return Reflect.get(target, prop, receiver)
-              return (...args: Parameters<typeof target.startSpan>) => {
-                const span = target.startSpan(...args)
-                span.setAttribute("session.id", input.sessionID)
-                return span
-              }
-            },
-          })
+      const telemetryContext = cfg.experimental?.openTelemetry
+        ? Option.getOrUndefined(yield* Effect.serviceOption(Otlp.CurrentTraceContext))
         : undefined
 
       // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
@@ -277,80 +268,85 @@ const live: Layer.Layer<
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
       return {
         type: "ai-sdk" as const,
-        result: streamText({
-          onError(error) {
-            bridge.fork(
-              Effect.logError("stream error", {
-                providerID: input.model.providerID,
-                modelID: input.model.id,
-                "session.id": input.sessionID,
-                small: (input.small ?? false).toString(),
-                agent: input.agent.name,
-                mode: input.agent.mode,
-                error,
-              }),
-            )
-          },
-          // Copilot returns the authoritative billed amount only in provider-specific response fields.
-          includeRawChunks: input.model.providerID.includes("github-copilot"),
-          async experimental_repairToolCall(failed) {
-            const lower = failed.toolCall.toolName.toLowerCase()
-            if (lower !== failed.toolCall.toolName && prepared.tools[lower]) {
+        telemetryContext,
+        result: Otlp.withTraceContext(telemetryContext, () =>
+          streamText({
+            onError(error) {
+              bridge.fork(
+                Effect.logError("stream error", {
+                  providerID: input.model.providerID,
+                  modelID: input.model.id,
+                  "session.id": input.sessionID,
+                  small: (input.small ?? false).toString(),
+                  agent: input.agent.name,
+                  mode: input.agent.mode,
+                  error,
+                }),
+              )
+            },
+            // Copilot returns the authoritative billed amount only in provider-specific response fields.
+            includeRawChunks: input.model.providerID.includes("github-copilot"),
+            async experimental_repairToolCall(failed) {
+              const lower = failed.toolCall.toolName.toLowerCase()
+              if (lower !== failed.toolCall.toolName && prepared.tools[lower]) {
+                return {
+                  ...failed.toolCall,
+                  toolName: lower,
+                }
+              }
               return {
                 ...failed.toolCall,
-                toolName: lower,
+                input: JSON.stringify({
+                  tool: failed.toolCall.toolName,
+                  error: failed.error.message,
+                }),
+                toolName: "invalid",
               }
-            }
-            return {
-              ...failed.toolCall,
-              input: JSON.stringify({
-                tool: failed.toolCall.toolName,
-                error: failed.error.message,
-              }),
-              toolName: "invalid",
-            }
-          },
-          temperature: prepared.params.temperature,
-          topP: prepared.params.topP,
-          topK: prepared.params.topK,
-          providerOptions: ProviderTransform.providerOptions(input.model, prepared.params.options),
-          activeTools: Object.keys(prepared.tools).filter((x) => x !== "invalid"),
-          tools: prepared.tools,
-          toolChoice: input.toolChoice,
-          maxOutputTokens: prepared.params.maxOutputTokens,
-          abortSignal: input.abort,
-          headers: prepared.headers,
-          maxRetries: input.retries ?? 0,
-          messages: prepared.messages,
-          model: wrapLanguageModel({
-            model: language,
-            middleware: [
-              {
-                specificationVersion: "v3" as const,
-                async transformParams(args) {
-                  if (args.type === "stream") {
-                    // @ts-expect-error
-                    args.params.prompt = ProviderTransform.message(
-                      args.params.prompt,
-                      input.model,
-                      prepared.messageTransformOptions,
-                    )
-                  }
-                  return args.params
-                },
-              },
-            ],
-          }),
-          experimental_telemetry: {
-            isEnabled: cfg.experimental?.openTelemetry,
-            functionId: "session.llm",
-            tracer: telemetryTracer,
-            metadata: {
-              userId: cfg.username ?? "unknown",
-              sessionId: input.sessionID,
             },
-          },
-        }),
+            temperature: prepared.params.temperature,
+            topP: prepared.params.topP,
+            topK: prepared.params.topK,
+            providerOptions: ProviderTransform.providerOptions(input.model, prepared.params.options),
+            activeTools: Object.keys(prepared.tools).filter((x) => x !== "invalid"),
+            tools: prepared.tools,
+            toolChoice: input.toolChoice,
+            maxOutputTokens: prepared.params.maxOutputTokens,
+            abortSignal: input.abort,
+            headers: prepared.headers,
+            maxRetries: input.retries ?? 0,
+            messages: prepared.messages,
+            model: wrapLanguageModel({
+              model: language,
+              middleware: [
+                {
+                  specificationVersion: "v3" as const,
+                  async transformParams(args) {
+                    if (args.type === "stream") {
+                      // @ts-expect-error
+                      args.params.prompt = ProviderTransform.message(
+                        args.params.prompt,
+                        input.model,
+                        prepared.messageTransformOptions,
+                      )
+                    }
+                    return args.params
+                  },
+                },
+              ],
+            }),
+            experimental_telemetry: {
+              isEnabled: cfg.experimental?.openTelemetry,
+              functionId: "session.llm",
+              tracer: telemetryTracer,
+              metadata: {
+                userId: cfg.username ?? "unknown",
+                sessionId: input.sessionID,
+                providerId: input.model.providerID,
+                modelId: input.model.id,
+              },
+            },
+          }),
+        ),
       }
     })
 
@@ -370,9 +366,8 @@ const live: Layer.Layer<
             // Adapter seam: both runtimes expose the same LLMEvent stream. Native
             // already returns one; AI SDK streams are converted here.
             const state = LLMAISDK.adapterState()
-            return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
-              e instanceof Error ? e : new Error(String(e)),
-            ).pipe(
+            const fullStream = Otlp.withAsyncIterableTraceContext(result.telemetryContext, result.result.fullStream)
+            return Stream.fromAsyncIterable(fullStream, (e) => (e instanceof Error ? e : new Error(String(e)))).pipe(
               Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
               Stream.flatMap((events) => Stream.fromIterable(events)),
             )
