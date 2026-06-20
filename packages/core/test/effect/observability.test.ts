@@ -1,14 +1,26 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { NodeFileSystem } from "@effect/platform-node"
+import { context as otelContext, trace, TraceFlags } from "@opentelemetry/api"
 import { Effect, Layer, Logger } from "effect"
+import { Headers as HttpHeaders } from "effect/unstable/http"
 import { OtlpSerialization } from "effect/unstable/observability"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
 import { fileLogger } from "../../src/observability/logging"
-import { protocol, resource, serializationLayer } from "../../src/observability/otlp"
+import {
+  logsExporterEnabled,
+  protocol,
+  resource,
+  serializationLayer,
+  traceContextFromHeaders,
+  tracesExporterEnabled,
+  withAsyncIterableTraceContext,
+} from "../../src/observability/otlp"
 
 const otelResourceAttributes = process.env.OTEL_RESOURCE_ATTRIBUTES
+const otelTracesExporter = process.env.OTEL_TRACES_EXPORTER
+const otelLogsExporter = process.env.OTEL_LOGS_EXPORTER
 const otelProtocol = process.env.OTEL_EXPORTER_OTLP_PROTOCOL
 const otelTracesProtocol = process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
 const otelLogsProtocol = process.env.OTEL_EXPORTER_OTLP_LOGS_PROTOCOL
@@ -17,6 +29,10 @@ const opencodeClient = process.env.OPENCODE_CLIENT
 afterEach(() => {
   if (otelResourceAttributes === undefined) delete process.env.OTEL_RESOURCE_ATTRIBUTES
   else process.env.OTEL_RESOURCE_ATTRIBUTES = otelResourceAttributes
+  if (otelTracesExporter === undefined) delete process.env.OTEL_TRACES_EXPORTER
+  else process.env.OTEL_TRACES_EXPORTER = otelTracesExporter
+  if (otelLogsExporter === undefined) delete process.env.OTEL_LOGS_EXPORTER
+  else process.env.OTEL_LOGS_EXPORTER = otelLogsExporter
   if (otelProtocol === undefined) delete process.env.OTEL_EXPORTER_OTLP_PROTOCOL
   else process.env.OTEL_EXPORTER_OTLP_PROTOCOL = otelProtocol
   if (otelTracesProtocol === undefined) delete process.env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
@@ -65,6 +81,86 @@ describe("protocol", () => {
     delete process.env.OTEL_EXPORTER_OTLP_LOGS_PROTOCOL
 
     expect(protocol("logs")).toBe("http/json")
+  })
+})
+
+describe("exporters", () => {
+  test("logs and traces exporters default to enabled", () => {
+    delete process.env.OTEL_TRACES_EXPORTER
+    delete process.env.OTEL_LOGS_EXPORTER
+
+    expect(tracesExporterEnabled()).toBe(true)
+    expect(logsExporterEnabled()).toBe(true)
+  })
+
+  test("logs and traces exporters can be disabled with standard none value", () => {
+    process.env.OTEL_TRACES_EXPORTER = "none"
+    process.env.OTEL_LOGS_EXPORTER = "none"
+
+    expect(tracesExporterEnabled()).toBe(false)
+    expect(logsExporterEnabled()).toBe(false)
+  })
+})
+
+describe("trace context", () => {
+  test("extracts valid incoming trace context", () => {
+    const traceContext = traceContextFromHeaders(
+      HttpHeaders.fromInput({
+        traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+      }),
+    )
+
+    const spanContext = traceContext ? trace.getSpanContext(traceContext.otelContext) : undefined
+    expect(spanContext).toMatchObject({
+      traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+      spanId: "00f067aa0ba902b7",
+      traceFlags: TraceFlags.SAMPLED,
+      isRemote: true,
+    })
+    expect(traceContext?.parentSpan).toMatchObject({
+      traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+      spanId: "00f067aa0ba902b7",
+      sampled: true,
+    })
+  })
+
+  test("ignores invalid W3C traceparent headers", () => {
+    expect(
+      traceContextFromHeaders(HttpHeaders.fromInput({ traceparent: "00-invalid-00f067aa0ba902b7-01" })),
+    ).toBeUndefined()
+    expect(
+      traceContextFromHeaders(
+        HttpHeaders.fromInput({ traceparent: "zz-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" }),
+      ),
+    ).toBeUndefined()
+  })
+
+  test("keeps W3C context active while consuming async iterables", async () => {
+    const { AsyncLocalStorageContextManager } = await import("@opentelemetry/context-async-hooks")
+    const manager = new AsyncLocalStorageContextManager().enable()
+    otelContext.setGlobalContextManager(manager)
+
+    const parent = traceContextFromHeaders(
+      HttpHeaders.fromInput({ traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" }),
+    )?.otelContext
+
+    try {
+      async function* readActiveTrace() {
+        yield trace.getSpanContext(otelContext.active())?.traceId
+        await Promise.resolve()
+        yield trace.getSpanContext(otelContext.active())?.traceId
+      }
+
+      const traceIds: Array<string | undefined> = []
+      for await (const traceId of withAsyncIterableTraceContext(parent, readActiveTrace())) {
+        traceIds.push(traceId)
+      }
+
+      expect(traceIds).toEqual(["4bf92f3577b34da6a3ce929d0e0e4736", "4bf92f3577b34da6a3ce929d0e0e4736"])
+    } finally {
+      otelContext.disable()
+      manager.disable()
+    }
   })
 })
 

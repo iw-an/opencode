@@ -1,5 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { Otlp } from "@opencode-ai/core/observability/otlp"
 import { Config } from "@/config/config"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Provider } from "@/provider/provider"
@@ -20,10 +21,9 @@ import { Global } from "@opencode-ai/core/global"
 import path from "path"
 import { Plugin } from "@/plugin"
 import { Skill } from "../skill"
-import { Effect, Context, Layer, Schema } from "effect"
-import { InstanceState } from "@/effect/instance-state"
-import * as Option from "effect/Option"
+import { Effect, Context, Layer, Option, Schema } from "effect"
 import * as OtelTracer from "@effect/opentelemetry/Tracer"
+import { InstanceState } from "@/effect/instance-state"
 import { AbsolutePath, type DeepMutable } from "@opencode-ai/core/schema"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -374,6 +374,9 @@ export const layer = Layer.effect(
         const tracer = cfg.experimental?.openTelemetry
           ? Option.getOrUndefined(yield* Effect.serviceOption(OtelTracer.OtelTracer))
           : undefined
+        const telemetryContext = cfg.experimental?.openTelemetry
+          ? Option.getOrUndefined(yield* Effect.serviceOption(Otlp.CurrentTraceContext))
+          : undefined
 
         const system = [PROMPT_GENERATE]
         yield* plugin.trigger("experimental.chat.system.transform", { model: resolved }, { system })
@@ -389,6 +392,8 @@ export const layer = Layer.effect(
             tracer,
             metadata: {
               userId: cfg.username ?? "unknown",
+              providerId: model.providerID,
+              modelId: model.modelID,
             },
           },
           temperature: 0.3,
@@ -415,22 +420,26 @@ export const layer = Layer.effect(
 
         if (isOpenaiOauth) {
           return yield* Effect.promise(async () => {
-            const result = streamObject({
-              ...params,
-              providerOptions: ProviderTransform.providerOptions(resolved, {
-                instructions: system.join("\n"),
-                store: false,
+            const result = Otlp.withTraceContext(telemetryContext, () =>
+              streamObject({
+                ...params,
+                providerOptions: ProviderTransform.providerOptions(resolved, {
+                  instructions: system.join("\n"),
+                  store: false,
+                }),
+                onError: () => {},
               }),
-              onError: () => {},
-            })
-            for await (const part of result.fullStream) {
+            )
+            for await (const part of Otlp.withAsyncIterableTraceContext(telemetryContext, result.fullStream)) {
               if (part.type === "error") throw part.error
             }
             return result.object
           })
         }
 
-        return yield* Effect.promise(() => generateObject(params).then((r) => r.object))
+        return yield* Effect.promise(() =>
+          Otlp.withTraceContext(telemetryContext, () => generateObject(params).then((r) => r.object)),
+        )
       }),
     })
   }),
